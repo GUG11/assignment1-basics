@@ -1,5 +1,7 @@
 import json
 import time
+import cProfile
+import pstats
 
 from .adapters import run_train_bpe
 from .common import FIXTURES_PATH, gpt2_bytes_to_unicode
@@ -22,6 +24,22 @@ def test_train_bpe_speed():
     )
     end_time = time.time()
     assert end_time - start_time < 1.5
+
+
+def test_train_bpe_toy():
+    input_path = FIXTURES_PATH / "toy.txt"
+    vocab, merges = run_train_bpe(
+        input_path=input_path,
+        vocab_size=1 + 256 + 6,
+        special_tokens=["<|endoftext|>"],
+    )
+    assert vocab[0] == b"<|endoftext|>"
+    for i in range(256):
+        assert vocab[i + 1] == bytes([i])
+    first_six_merges = [(b"s", b"t"), (b"e", b"st"), (b"o", b"w"), (b"l", b"ow"), (b"w", b"est"), (b"n", b"e")]
+    for i in range(257, 263):
+        assert vocab[i] == first_six_merges[i - 257][0] + first_six_merges[i - 257][1]
+        assert merges == first_six_merges
 
 
 def test_train_bpe():

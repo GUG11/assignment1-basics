@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import regex as re
 from collections.abc import Iterable
+from collections import Counter, defaultdict
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
@@ -589,4 +591,90 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    text = ""
+    with open(input_path) as f:
+        text = f.read()
+
+    escaped_special_tokens = [re.escape(token) for token in special_tokens]
+    special_token_pat = re.compile("|".join(escaped_special_tokens))
+    segments = special_token_pat.split(text)
+    tokenize_pat = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+    pre_tokenized_items = []
+    for segment in segments:
+        pre_tokenized_items.extend(tokenize_pat.findall(segment))
+
+    pre_tokenized_count = Counter(pre_tokenized_items)
+    raw_token_count = dict()
+    for pre_token, count in pre_tokenized_count.items():
+        pre_token_utf8 = pre_token.encode("utf-8")
+        raw_token = tuple(bytes([b]) for b in pre_token_utf8)
+        raw_token_count[raw_token] = count
+
+    vocab = {i: token.encode("utf-8") for i, token in enumerate(special_tokens)}
+    cur_idx = len(vocab)
+    for i in range(256):
+        vocab[cur_idx] = bytes([i])
+        cur_idx += 1
+
+    bpe_merges = []
+    merged_token_total_count = defaultdict(int)
+    merged_token_sources = defaultdict(lambda: defaultdict(list))
+
+    while cur_idx < vocab_size:
+        for raw_token, count in raw_token_count.items():
+            for i in range(len(raw_token) - 1):
+                merged_token = (raw_token[i], raw_token[i + 1])
+                merged_token_total_count[merged_token] += count
+                merged_token_sources[merged_token][raw_token].append(i)
+
+        best_token, best_count = max(merged_token_total_count.items(), key=lambda x: (x[1], x[0]))
+        vocab[cur_idx] = best_token[0] + best_token[1]
+        bpe_merges.append((best_token[0], best_token[1]))
+
+        for raw_token, indexes in merged_token_sources[best_token].items():
+            cur_token_count = raw_token_count[raw_token]
+            del raw_token_count[raw_token]
+            raw_token_after_merge = tuple()
+            for i in range(len(indexes)):
+                start_idx = indexes[i - 1] + 2 if (0 < i) else 0
+                end_idx = indexes[i]
+                raw_token_after_merge += raw_token[start_idx:end_idx] + (raw_token[end_idx] + raw_token[end_idx + 1],)
+            raw_token_after_merge += raw_token[end_idx + 2 :]
+            raw_token_count[raw_token_after_merge] = cur_token_count
+        #
+        #             if 0 < idx:
+        #                 affected_prefix = (raw_token[idx - 1], raw_token[idx])
+        #                 merged_token_total_count[affected_prefix] -= cur_token_count
+        #                 del merged_token_sources[affected_prefix][raw_token]
+        #                 new_merged_prefix_token = (raw_token[idx - 1], vocab[cur_idx])
+        #                 merged_token_total_count[new_merged_prefix_token] += cur_token_count
+        #                 merged_token_sources[new_merged_prefix_token][raw_token_after_merge] = cur_token_count
+        #
+        #             if idx + 2 < len(raw_token):
+        #                 affected_suffix = (raw_token[idx + 1], raw_token[idx + 2])
+        #                 merged_token_total_count[affected_suffix] -= cur_token_count
+        #                 del merged_token_sources[affected_suffix][raw_token]
+        #                 new_merged_suffix_token = (vocab[cur_idx], raw_token[idx + 2])
+        #                 merged_token_total_count[new_merged_suffix_token] += cur_token_count
+        #                 merged_token_sources[new_merged_suffix_token][raw_token_after_merge] = cur_token_count
+        #
+        #         del merged_token_total_count[best_token]
+        #         del merged_token_sources[best_token]
+        merged_token_total_count.clear()
+        merged_token_sources.clear()
+        cur_idx += 1
+
+    return vocab, bpe_merges
+
+
+"""
+{low: 5, lower: 2, widest: 3, newest: 6}
+
+   we er   wi id ed es st ne ew we
+
+lo: [(low, (0,1)), (lowest, (0,1))]
+ow: [(low, (1,2)), (lowest, (1,2))]
+
+l -> o -> w -> e -> r
+"""
