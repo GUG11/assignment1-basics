@@ -13,19 +13,9 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from tests.utils.linkedlist import MergeSource
+from tests.utils.logger import get_logger
 
-logger = logging.getLogger("bpe_debug")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-logger.propagate = False
-
-handler = logging.FileHandler("/tmp/debug.log", mode="w")
-handler.setLevel(logging.DEBUG)
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(filename)s:%(lineno)d %(message)s"))
-
-logger.addHandler(handler)
-
-logger.debug("file handler works")
+logger = get_logger("debug")
 
 
 def run_linear(

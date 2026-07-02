@@ -1,7 +1,5 @@
 import json
 import time
-import cProfile
-import pstats
 
 from .adapters import run_train_bpe
 from .common import FIXTURES_PATH, gpt2_bytes_to_unicode
