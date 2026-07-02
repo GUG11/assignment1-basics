@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import logging
 import os
+import regex as re
 from collections.abc import Iterable
+from collections import Counter, defaultdict
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
+import time
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from tests.utils.linkedlist import MergeSource
+from tests.utils.logger import get_logger
+
+logger = get_logger("debug")
 
 
 def run_linear(
@@ -589,4 +597,147 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    start_ts = time.time()
+    text = ""
+    with open(input_path) as f:
+        text = f.read()
+
+    escaped_special_tokens = [re.escape(token) for token in special_tokens]
+    special_token_pat = re.compile("|".join(escaped_special_tokens))
+    segments = special_token_pat.split(text)
+    tokenize_pat = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+    pre_tokenized_items = []
+    for segment in segments:
+        pre_tokenized_items.extend(tokenize_pat.findall(segment))
+
+    pre_tokenized_count = Counter(pre_tokenized_items)
+    pre_token_count = dict()
+
+    pre_tokenization_ts = time.time()
+
+    pre_token_list = []
+    for pre_token, count in pre_tokenized_count.items():
+        pre_token_utf8 = pre_token.encode("utf-8")
+        if len(pre_token_utf8) == 1:
+            continue
+        head_merge_source = cur_merge_source = MergeSource(
+            left_token=pre_token_utf8[0:1],
+            right_token=pre_token_utf8[1:2],
+            raw_token=pre_token_utf8,
+            count=count,
+            prev=None,
+            next=None,
+        )
+        for i in range(2, len(pre_token_utf8)):
+            next_merge_source = MergeSource(
+                left_token=pre_token_utf8[i - 1 : i],
+                right_token=pre_token_utf8[i : i + 1],
+                raw_token=pre_token_utf8,
+                count=count,
+                prev=cur_merge_source,
+                next=None,
+            )
+            cur_merge_source.next = next_merge_source
+            cur_merge_source = next_merge_source
+        pre_token_list.append((pre_token_utf8, head_merge_source))
+        pre_token_count[pre_token_utf8] = count
+        # raw_token = tuple(bytes([b]) for b in pre_token_utf8)
+        # pre_token_count[raw_token] = count
+
+    construct_merge_source_ts = time.time()
+
+    vocab = {i: token.encode("utf-8") for i, token in enumerate(special_tokens)}
+    cur_idx = len(vocab)
+    for i in range(256):
+        vocab[cur_idx] = bytes([i])
+        cur_idx += 1
+
+    bpe_merges = []
+    merged_token_total_count = defaultdict(int)
+    merged_token_sources = defaultdict(dict)
+
+    for pre_token, current_merge_source in pre_token_list:
+        count = pre_token_count[pre_token]
+        while current_merge_source is not None:
+            merged_token = (current_merge_source.left_token, current_merge_source.right_token)
+            merged_token_total_count[merged_token] += count
+            merged_token_sources[merged_token][id(current_merge_source)] = current_merge_source
+            current_merge_source = current_merge_source.next
+
+    initial_token_count_ts = time.time()
+
+    while cur_idx < vocab_size:
+        # logger.debug(f"merged_token_total_count: {merged_token_total_count.items()}")
+        best_token, best_count = max(merged_token_total_count.items(), key=lambda x: (x[1], x[0]))
+        vocab[cur_idx] = best_token[0] + best_token[1]
+        bpe_merges.append((best_token[0], best_token[1]))
+        # logger.debug(
+        #     f"[before update merge] best_token={best_token}, best_count={best_count}, vocab[{cur_idx}]={vocab[cur_idx]}, merged_token_total_count={merged_token_total_count.items()}"
+        # )
+
+        for merge_source_id, merge_source in list(merged_token_sources[best_token].items()):
+            prev_src, next_src = merge_source.prev, merge_source.next
+            count = merge_source.count
+            if merge_source.left_token != best_token[0] or merge_source.right_token != best_token[1]:
+                continue
+            if prev_src is not None:
+                merged_token_total_count[(prev_src.left_token, prev_src.right_token)] -= count
+                del merged_token_sources[(prev_src.left_token, prev_src.right_token)][id(prev_src)]
+                prev_src.right_token = vocab[cur_idx]
+                prev_src.next = next_src
+                merged_token_total_count[(prev_src.left_token, prev_src.right_token)] += count
+                merged_token_sources[(prev_src.left_token, prev_src.right_token)][id(prev_src)] = prev_src
+
+            if next_src is not None:
+                merged_token_total_count[(next_src.left_token, next_src.right_token)] -= count
+                del merged_token_sources[(next_src.left_token, next_src.right_token)][id(next_src)]
+                next_src.left_token = vocab[cur_idx]
+                next_src.prev = prev_src
+                merged_token_total_count[(next_src.left_token, next_src.right_token)] += count
+                merged_token_sources[(next_src.left_token, next_src.right_token)][id(next_src)] = next_src
+            # logger.debug(
+            #     f"[update total count] merge_source={merge_source}, prev_src={prev_src}, next_src={next_src}, merged_token_total_count={merged_token_total_count.items()}"
+            # )
+
+        for key, count in list(merged_token_total_count.items()):
+            if count == 0:
+                del merged_token_total_count[key]
+
+        del merged_token_total_count[best_token]
+        del merged_token_sources[best_token]
+        # logger.debug(
+        #     f"[after update merge] best_token={best_token}, best_count={best_count}, vocab[{cur_idx}]={vocab[cur_idx]}, merged_token_total_count={merged_token_total_count.items()}"
+        # )
+        cur_idx += 1
+
+    finish_merge_ts = time.time()
+    logger.info(
+        f"[BPE] pre_tokenization_time_elapsed={pre_tokenization_ts - start_ts:.2f},"
+        f"construct_merge_source_time_elapsed={construct_merge_source_ts - pre_tokenization_ts:.2f},"
+        f"initialization_count_time_elapsed={initial_token_count_ts - construct_merge_source_ts:.2f},"
+        f"merge_time_elapsed={finish_merge_ts - initial_token_count_ts:.2f},"
+    )
+
+    return vocab, bpe_merges
+
+
+"""
+{low: 5, lower: 2, widest: 3, newest: 6}
+
+   we er   wi id ed es st ne ew we
+
+class TokenMetadata:
+    total_cnt: int
+    sources: List[TokenSource]
+
+class TokenSource:
+    token: bytes
+    interval: Dict[int, int]
+lo: [(low, {0:1}), (lowest, (0,1))]
+ow: [(low, (1,2)), (lowest, (1,2))]
+
+l -> o -> w -> e -> r
+
+
+"""
